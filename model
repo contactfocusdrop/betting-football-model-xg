@@ -1,0 +1,421 @@
+library(readr)
+
+Brasil_A_26 <- read_csv("Brasil A 26.csv")
+
+# View(Brasil_A_26)
+glimpse(Brasil_A_26)
+names(Brasil_A_26)
+table(Brasil_A_26$type.name)
+
+
+# =========================
+# PACOTES
+# =========================
+install.packages("")
+
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(janitor)
+library(caret)
+library(xgboost)
+library(glmnet)
+library(yardstick)
+
+# =========================
+# LIMPEZA
+# =========================
+
+dados <- Brasil_A_26 %>%
+  
+  filter(
+    !is.na(team_name),
+    !is.na(type_name)
+  ) %>%
+  
+  mutate(
+    
+    # coordenadas padronizadas
+    location_x = as.numeric(location_x),
+    location_y = as.numeric(location_y),
+    
+    pass_end_location_x = as.numeric(pass_end_location_x),
+    pass_end_location_y = as.numeric(pass_end_location_y),
+    
+    minute = as.numeric(minute),
+    
+    # eventos
+    is_pass = ifelse(type_name == "Pass", 1, 0),
+    is_shot = ifelse(type_name == "Shot", 1, 0),
+    is_pressure = ifelse(type_name == "Pressure", 1, 0),
+    is_duel = ifelse(type_name == "Duel", 1, 0),
+    is_carry = ifelse(type_name == "Carry", 1, 0)
+    
+  )
+
+# =========================
+# FEATURES OFENSIVAS
+# =========================
+
+dados <- dados %>%
+  
+  mutate(
+    
+    # último terço
+    final_third_entry = ifelse(location_x >= 80, 1, 0),
+    
+    # pressão alta
+    high_pressure = ifelse(
+      type_name == "Pressure" &
+        location_x >= 70,
+      1,
+      0
+    ),
+    
+    # passe progressivo
+    progressive_pass = ifelse(
+      type_name == "Pass" &
+        pass_end_location_x - location_x >= 15,
+      1,
+      0
+    ),
+    
+    # carry progressivo
+    progressive_carry = ifelse(
+      type_name == "Carry" &
+        carry_end_location_x - location_x >= 10,
+      1,
+      0
+    )
+    
+  )
+
+# =========================
+# xG SIMPLES
+# =========================
+
+shots <- dados %>%
+  
+  filter(type_name == "Shot") %>%
+  
+  mutate(
+    
+    # distância ao centro do gol
+    shot_distance = sqrt(
+      (120 - location_x)^2 +
+        (40 - location_y)^2
+    ),
+    
+    # variável alvo
+    goal = ifelse(
+      shot_outcome_name == "Goal",
+      1,
+      0
+    )
+    
+  )
+
+
+# =========================
+# MODELO xG
+# =========================
+
+modelo_xg <- glm(
+  
+  goal ~ shot_distance,
+  
+  data = shots,
+  
+  family = binomial()
+)
+
+# =========================
+# PREVISÃO xG
+# =========================
+
+shots$xg <- predict(
+  modelo_xg,
+  newdata = shots,
+  type = "response"
+)
+
+# =========================
+# MÉTRICAS DOS TIMES
+# =========================
+
+team_metrics <- dados %>%
+  
+  group_by(team_name) %>%
+  
+  summarise(
+    
+    passes = sum(is_pass, na.rm = TRUE),
+    
+    shots = sum(is_shot, na.rm = TRUE),
+    
+    pressures = sum(is_pressure, na.rm = TRUE),
+    
+    high_pressures = sum(high_pressure, na.rm = TRUE),
+    
+    progressive_passes = sum(progressive_pass, na.rm = TRUE),
+    
+    progressive_carries = sum(progressive_carry, na.rm = TRUE),
+    
+    final_third_entries = sum(final_third_entry, na.rm = TRUE)
+    
+  ) %>%
+  
+  arrange(desc(shots))
+
+
+# =========================
+# xG POR TIME
+# =========================
+
+team_xg <- shots %>%
+  
+  group_by(team_name) %>%
+  
+  summarise(
+    
+    total_xg = sum(xg, na.rm = TRUE),
+    
+    goals = sum(goal, na.rm = TRUE),
+    
+    shots = n(),
+    
+    avg_xg_per_shot = mean(xg, na.rm = TRUE)
+    
+  ) %>%
+  
+  arrange(desc(total_xg))
+
+# =========================
+# FORÇA OFENSIVA
+# =========================
+
+media_xg <- mean(team_xg$total_xg)
+
+team_xg <- team_xg %>%
+  
+  mutate(
+    
+    attack_strength = total_xg / media_xg
+    
+  )
+
+# =========================
+# ODD JUSTA
+# =========================
+
+probabilidade_over25 <- 0.62
+
+odd_justa <- 1 / probabilidade_over25
+
+odd_justa
+
+# =========================
+# OVER 2.5
+# =========================
+
+lambda_home <- 1.7
+lambda_away <- 1.2
+
+max_goals <- 10
+
+matriz <- expand.grid(
+  home = 0:max_goals,
+  away = 0:max_goals
+)
+
+matriz$prob <- dpois(
+  matriz$home,
+  lambda_home
+) *
+  dpois(
+    matriz$away,
+    lambda_away
+  )
+
+prob_over25 <- matriz %>%
+  
+  filter(home + away >= 3) %>%
+  
+  summarise(prob = sum(prob)) %>%
+  
+  pull(prob)
+
+odd_justa_over25 <- 1 / prob_over25
+
+odd_justa_over25
+
+
+library(tidyverse)
+library(gt)
+library(scales)
+library(janitor)
+
+dados <- Brasil_A_26 %>%
+  clean_names()
+
+
+team_projection <- dados %>%
+  
+  group_by(team_name) %>%
+  
+  summarise(
+    
+    # PASSES
+    total_passes = sum(type_name == "Pass", na.rm = TRUE),
+    
+    # FINALIZAÇÕES
+    shots = sum(type_name == "Shot", na.rm = TRUE),
+    
+    # PRESSÃO
+    pressures = sum(type_name == "Pressure", na.rm = TRUE),
+    
+    # ENTRADAS NO ÚLTIMO TERÇO
+    final_third_entries = sum(location_x >= 80, na.rm = TRUE),
+    
+    # RECUPERAÇÕES ALTAS
+    high_recoveries = sum(
+      type_name == "Ball Recovery" &
+        location_x >= 70,
+      na.rm = TRUE
+    ),
+    
+    # CHUTES NO ALVO
+    shots_on_target = sum(
+      type_name == "Shot" &
+        shot_outcome_name %in% c("Goal", "Saved"),
+      na.rm = TRUE
+    ),
+    
+    # GOLS
+    goals = sum(
+      shot_outcome_name == "Goal",
+      na.rm = TRUE
+    )
+    
+  ) %>%
+  
+  mutate(
+    
+    # xG SIMPLIFICADO
+    projected_goals = round(shots * 0.11, 2),
+    
+    # CLEAN SHEET %
+    clean_sheet_pct = round(
+      pmax(
+        0,
+        100 - (shots_on_target * 1.5)
+      ),
+      1
+    ),
+    
+    # ÍNDICE OFENSIVO
+    attack_index = round(
+      (
+        shots * 0.4 +
+          final_third_entries * 0.3 +
+          pressures * 0.3
+      ) / 100,
+      2
+    )
+    
+  )
+
+team_projection <- team_projection %>%
+  
+  mutate(
+    
+    best_market = case_when(
+      
+      projected_goals >= 2.0 &
+        clean_sheet_pct <= 40
+      ~ "Over 2.5",
+      
+      projected_goals >= 1.8 &
+        clean_sheet_pct >= 55
+      ~ "Win to Nil",
+      
+      projected_goals <= 1.2 &
+        clean_sheet_pct >= 60
+      ~ "Under 2.5",
+      
+      pressures >= quantile(pressures, 0.75)
+      ~ "Corners",
+      
+      TRUE
+      ~ "BTTS"
+    )
+    
+  )
+
+projection_table <- team_projection %>%
+  
+  select(
+    team_name,
+    projected_goals,
+    clean_sheet_pct,
+    attack_index,
+    pressures,
+    final_third_entries,
+    best_market
+  ) %>%
+  
+  arrange(desc(projected_goals)) %>%
+  
+  gt() %>%
+  
+  tab_header(
+    title = "TEAM PROJECTIONS",
+    subtitle = "Quantitative Football Betting Model"
+  ) %>%
+  
+  cols_label(
+    team_name = "TEAM",
+    projected_goals = "Projected Goals",
+    clean_sheet_pct = "Clean Sheet %",
+    attack_index = "Attack Index",
+    pressures = "Pressures",
+    final_third_entries = "Final Third",
+    best_market = "Best Market"
+  ) %>%
+  
+  data_color(
+    columns = projected_goals,
+    colors = col_numeric(
+      palette = c("#dbeafe", "#2563eb"),
+      domain = NULL
+    )
+  ) %>%
+  
+  data_color(
+    columns = clean_sheet_pct,
+    colors = col_numeric(
+      palette = c("#fee2e2", "#16a34a"),
+      domain = NULL
+    )
+  ) %>%
+  
+  data_color(
+    columns = attack_index,
+    colors = col_numeric(
+      palette = c("#f3e8ff", "#7c3aed"),
+      domain = NULL
+    )
+  )
+projection_table
+
+
+gtsave(
+  projection_table,
+  "team_projection.png"
+)
+
+write.csv(
+  team_projection,
+  "team_projection.csv",
+  row.names = FALSE
+)
